@@ -1,166 +1,199 @@
-# app.py — QuarterBand minimal tracker with charts + basic auth
-
+# app.py
 import os
-import asyncio
-import secrets
-from datetime import datetime, timedelta
+import math
+import time
+import requests
+from functools import wraps
+from flask import Flask, request, Response, render_template_string, jsonify
 
-import aiohttp
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from starlette.requests import Request
+app = Flask(__name__)
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "QuarterBand/1.0 (+https://quarterband)"})
 
-# -------- Config --------
-COINBASE_API = "https://api.exchange.coinbase.com"
-# Pairs to track (you can expand this list later)
-PAIRS = ["BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "AVAX-USD", "DOGE-USD"]
+COINBASE_EXCHANGE_API = "https://api.exchange.coinbase.com"  # public, no key required
 
-# refresh page & price-poller cadence
-REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "60"))
+###############################################################################
+# Auth
+###############################################################################
+QB_USER = os.getenv("QB_USER", "admin")
+QB_PASS = os.getenv("QB_PASS", "password")
 
-# Basic auth (set APP_USER / APP_PASS in Render)
-APP_USER = os.getenv("APP_USER", "admin")
-APP_PASS = os.getenv("APP_PASS", "password")
+def check_auth(username, password):
+    return username == QB_USER and password == QB_PASS
 
-security = HTTPBasic()
-
-def check_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    if not (
-        secrets.compare_digest(credentials.username, APP_USER)
-        and secrets.compare_digest(credentials.password, APP_PASS)
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return True
-
-app = FastAPI(title="QuarterBand", version="0.1.0")
-
-# in-memory price cache
-prices = {}  # { "BTC-USD": 64321.0, ... }
-
-async def fetch_price(session: aiohttp.ClientSession, pair: str):
-    url = f"{COINBASE_API}/products/{pair}/ticker"
-    try:
-        async with session.get(url, timeout=15) as resp:
-            data = await resp.json()
-            return pair, float(data["price"])
-    except Exception:
-        return pair, None
-
-async def price_loop():
-    global prices
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                tasks = [fetch_price(session, p) for p in PAIRS]
-                results = await asyncio.gather(*tasks, return_exceptions=False)
-                prices = {p: v for p, v in results if v is not None}
-        except Exception as e:
-            print("price_loop error:", e)
-        await asyncio.sleep(REFRESH_SECONDS)
-
-@app.on_event("startup")
-async def on_startup():
-    asyncio.create_task(price_loop())
-
-# ---------------- Routes ----------------
-
-HTML = """
-<!doctype html><html lang="en"><head>
-<meta charset="utf-8"/><title>QuarterBand 70/30</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<meta http-equiv="refresh" content="{{ refresh_seconds }}">
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<style>
-  body{margin:0;background:#0b0f14;color:#e6edf3;font-family:system-ui,Arial}
-  header{padding:24px;border-bottom:1px solid #1f2937}
-  h1{margin:0 0 6px 0}
-  #cards,#charts{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;padding:16px}
-  .card{background:#111826;border:1px solid #1f2937;border-radius:12px;padding:14px;min-width:160px;text-align:center}
-  canvas{background:#111826;border:1px solid #1f2937;border-radius:12px;padding:12px;margin:6px}
-</style>
-</head><body>
-<header>
-  <h1>QuarterBand 70/30</h1>
-  <div style="opacity:.7">Auto-refreshes every {{ refresh_seconds }}s • Basic-Auth protected</div>
-</header>
-
-<section id="cards"></section>
-
-<h2 style="text-align:center;margin:0;padding:8px 0 0 0;">Performance charts</h2>
-<section id="charts"></section>
-
-<script>
-async function load() {
-  const picks = await (await fetch('/api/top-picks', {cache:'no-store'})).json();
-
-  // price cards
-  const cards = document.getElementById('cards');
-  cards.innerHTML = '';
-  picks.forEach(p => {
-    const d = document.createElement('div');
-    d.className = 'card';
-    d.innerHTML = `<div style="font-weight:600">${p.pair}</div><div>$${p.price.toFixed(4)}</div>`;
-    cards.appendChild(d);
-  });
-
-  // charts (first 3)
-  const charts = document.getElementById('charts');
-  charts.innerHTML = '';
-  for (const p of picks.slice(0,3)) {
-    const res = await fetch('/api/candles/' + encodeURIComponent(p.pair), {cache:'no-store'});
-    const hist = await res.json();
-    const c = document.createElement('canvas');
-    c.width = 360; c.height = 220;
-    charts.appendChild(c);
-    new Chart(c.getContext('2d'), {
-      type: 'line',
-      data: {
-        labels: hist.times,
-        datasets: [{ label: p.pair, data: hist.prices, borderWidth: 2, fill: false, tension: .25, pointRadius: 0 }]
-      },
-      options: { plugins:{legend:{display:false}}, scales:{x:{display:false}, y:{beginAtZero:false}} }
-    });
-  }
-}
-load();
-</script>
-</body></html>
-"""
-
-@app.get("/", response_class=HTMLResponse, dependencies=[Depends(check_auth)])
-async def home(_: Request):
-    return HTML.replace("{{ refresh_seconds }}", str(REFRESH_SECONDS))
-
-@app.get("/api/top-picks", dependencies=[Depends(check_auth)])
-async def api_top_picks():
-    # simple “top” = highest prices (adjust later to your real ranking)
-    ordered = sorted(prices.items(), key=lambda kv: kv[1] or 0, reverse=True)
-    return [{"pair": p, "price": v} for p, v in ordered]
-
-@app.get("/api/candles/{product_id}", dependencies=[Depends(check_auth)])
-async def api_candles(product_id: str):
-    """Return ~30 daily closes for the pair to draw a chart."""
-    end = datetime.utcnow().replace(microsecond=0)
-    start = end - timedelta(days=31)
-    url = (
-        f"{COINBASE_API}/products/{product_id}/candles"
-        f"?granularity=86400&start={start.isoformat()}&end={end.isoformat()}"
+def authenticate():
+    return Response(
+        "Authentication required", 401,
+        {"WWW-Authenticate": 'Basic realm="QuarterBand"'}
     )
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=15) as resp:
-            data = await resp.json()
-    if not isinstance(data, list):
-        return {"times": [], "prices": []}
-    data.sort(key=lambda r: r[0])  # [time, low, high, open, close, volume]
-    times = [datetime.utcfromtimestamp(int(r[0])).strftime("%m-%d") for r in data[-30:]]
-    closes = [float(r[4]) for r in data[-30:]]
-    return {"times": times, "prices": closes}
 
-@app.get("/api/health")
-async def health():
-    return {"status": "ok", "count": len(prices), "updated": datetime.utcnow().isoformat() + "Z"}
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
+
+###############################################################################
+# Data fetch
+###############################################################################
+def coinbase_get(path, **params):
+    url = f"{COINBASE_EXCHANGE_API}{path}"
+    r = SESSION.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def list_usd_products():
+    """
+    Returns product dicts like {'id':'BTC-USD', 'base_currency':'BTC', ...}
+    Filters: quote_currency=USD, status='online', trading disabled False
+    """
+    products = coinbase_get("/products")
+    out = []
+    for p in products:
+        if (
+            p.get("quote_currency") == "USD" and
+            p.get("status") == "online" and
+            not p.get("trading_disabled", False)
+        ):
+            out.append({"id": p["id"], "base": p["base_currency"]})
+    return out
+
+def fetch_snapshot(product_id):
+    """
+    Grabs last price and 24h stats for a product.
+    /ticker -> last price
+    /stats  -> open, high, low, volume
+    """
+    ticker = coinbase_get(f"/products/{product_id}/ticker")
+    stats = coinbase_get(f"/products/{product_id}/stats")
+    price = float(ticker.get("price") or ticker.get("last") or 0.0)
+
+    # stats fields come as strings
+    def f(k, default=0.0):
+        try:
+            return float(stats.get(k, default))
+        except Exception:
+            return default
+
+    open_px = f("open")
+    high = f("high")
+    low = f("low")
+    volume = f("volume")
+    return {
+        "pair": product_id,
+        "price": price,
+        "open": open_px,
+        "high": high,
+        "low": low,
+        "volume": volume,
+        "ts": int(time.time()),
+    }
+
+###############################################################################
+# Scoring (proxy for probability of +70% in 30 days)
+###############################################################################
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def probability_score(snap):
+    """
+    Simple, explainable proxy while you build the real model.
+    Components (all 0..1 then weighted):
+      - Momentum (m): (price - open)/open (capped to [-0.2, +0.2]) -> rescale to 0..1
+      - Intraday expansion (e): (high-low)/open (cap 0..0.25)  -> 0..1
+      - Volume impulse (v): log(volume) vs. heuristic range -> 0..1
+    Score = 0.5*m + 0.35*e + 0.15*v, then mapped to a pseudo probability 0..1
+    """
+    price, open_px, high, low, vol = (
+        snap["price"], snap["open"], snap["high"], snap["low"], snap["volume"]
+    )
+    if open_px <= 0 or price <= 0:
+        return 0.05
+
+    # Momentum: favor positive drift since open
+    mom_raw = clamp((price - open_px) / open_px, -0.20, 0.20)  # -20%..+20%
+    m = (mom_raw + 0.20) / 0.40  # -> 0..1
+
+    # Expansion: wider range suggests potential breakout regime
+    exp_raw = clamp((high - low) / max(open_px, 1e-9), 0.0, 0.25)  # 0..25%
+    e = exp_raw / 0.25
+
+    # Volume impulse: log-scale normalization (heuristic)
+    v = clamp((math.log10(max(vol, 1e-6)) - 0) / 8, 0.0, 1.0)
+
+    score = 0.50 * m + 0.35 * e + 0.15 * v
+
+    # Map score to pseudo-probability of +70%/30d.
+    # NOTE: Replace with your calibrated model later.
+    prob = clamp(0.05 + 0.90 * score, 0.01, 0.99)
+    return prob
+
+###############################################################################
+# Entry / Exit discipline
+###############################################################################
+def entry_exit_bands(snap):
+    """
+    Naive, rule-based bands to start (replace with backtested model):
+      - Entry: price within 3% of (open + 20% of (high-low))  => early strength
+      - Stop:  -8% from entry_ref
+      - TP1:   +20%, TP2: +70% (target condition)
+    """
+    open_px, high, low, price = snap["open"], snap["high"], snap["low"], snap["price"]
+    if open_px <= 0:
+        return {"entry_band": None, "stop": None, "tp1": None, "tp2": None}
+
+    rng = max(high - low, 0)
+    entry_ref = open_px + 0.20 * rng
+    band_lo = entry_ref * 0.97
+    band_hi = entry_ref * 1.03
+    stop = entry_ref * 0.92        # -8%
+    tp1 = entry_ref * 1.20         # +20%
+    tp2 = entry_ref * 1.70         # +70%
+
+    should_enter_now = band_lo <= price <= band_hi
+
+    return {
+        "entry_ref": entry_ref,
+        "entry_band": (band_lo, band_hi),
+        "enter_now": should_enter_now,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+    }
+
+###############################################################################
+# Coinbase links
+###############################################################################
+def coinbase_trade_url(pair: str) -> str:
+    return f"https://www.coinbase.com/advanced-trade/spot/{pair}"
+
+###############################################################################
+# Routes
+###############################################################################
+INDEX_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>QuarterBand 70/30</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Auto refresh -->
+  <meta http-equiv="refresh" content="60" />
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, sans-serif; background: #0b1220; color: #e6edf3; }
+    .wrap { max-width: 1100px; margin: 32px auto; padding: 0 16px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    .muted { color: #9aa4b2; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(240px,1fr)); gap: 16px; margin-top: 20px; }
+    .tile { display: block; background: #111a2b; border-radius: 14px; padding: 16px; text-decoration: none; border: 1px solid #1c2940; transition: background .15s, transform .06s; }
+    .tile:hover { background: #15233a; transform: translateY(-1px); }
+    .pair { font-weight: 700; font-size: 18px; color: #e6edf3; }
+    .price { margin-top: 6px; font-size: 22px; color: #cbd5e1; }
+    .prob { margin-top: 10px; font-size: 13px; color: #9aa4b2; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; background:#1f2e4a; color:#e6edf3; margin-left:8px; }
+    .section { margin-top: 30px; }
+    table { width:
