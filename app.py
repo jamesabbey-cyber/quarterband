@@ -232,6 +232,11 @@ HTML_TEMPLATE = """
 <meta charset="utf-8"/><title>QuarterBand 70/30</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <meta http-equiv="refresh" content="{{ refresh_seconds }}">
+<meta http-equiv="refresh" content="{{ refresh_seconds }}">
+
+<!-- Chart.js for graphs -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
 <style>
 :root{--bg:#0b0f14;--card:#111826;--text:#e6edf3;--muted:#97a3ad;--accent:#5b9cff;--border:#1f2937}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial;background:var(--bg);color:var(--text)}
