@@ -209,4 +209,4 @@ def hourly_seasonality(pair, days=30, gran=3600):
     Returns: dict with mean_z_by_hour[0..23], buy_hours, sell_hours.
     """
     try:
-        candle
+
