@@ -233,9 +233,89 @@ HTML_TEMPLATE = """
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <meta http-equiv="refresh" content="{{ refresh_seconds }}">
 <meta http-equiv="refresh" content="{{ refresh_seconds }}">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <!-- Chart.js for graphs -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<!-- Charts container -->
+<section id="charts" style="padding:16px;">
+  <!-- canvases will be injected here by JS -->
+</section>
+
+<script>
+(async () => {
+  // how many charts to render
+  const MAX_CHARTS = 3;
+
+  // helper to make a canvas + title per token
+  function addChartCanvas(parent, title) {
+    const wrap = document.createElement('div');
+    wrap.style.margin = '16px 0';
+    wrap.style.background = 'rgba(255,255,255,0.02)';
+    wrap.style.border = '1px solid #1f2937';
+    wrap.style.borderRadius = '12px';
+    wrap.style.padding = '12px';
+
+    const h = document.createElement('h3');
+    h.textContent = title;
+    h.style.margin = '0 0 8px 0';
+    h.style.fontSize = '16px';
+
+    const c = document.createElement('canvas');
+    c.width = 600;
+    c.height = 200;
+
+    wrap.appendChild(h);
+    wrap.appendChild(c);
+    parent.appendChild(wrap);
+    return c;
+  }
+
+  // fetch top picks from your API (already behind Basic Auth)
+  const picksResp = await fetch('/api/top-picks', { cache: 'no-store' });
+  const picksData = await picksResp.json();
+  const picks = Array.isArray(picksData.picks) ? picksData.picks : (Array.isArray(picksData) ? picksData : []);
+
+  if (!picks.length) return;
+
+  const chartsRoot = document.getElementById('charts');
+
+  for (const p of picks.slice(0, MAX_CHARTS)) {
+    // request 30 daily candles for this product from the new backend route
+    const r = await fetch(`/api/candles/${encodeURIComponent(p.product_id)}`, { cache: 'no-store' });
+    const data = await r.json();
+    if (!data || !data.labels || !data.closes) continue;
+
+    const canvas = addChartCanvas(chartsRoot, `${p.symbol} – 30D Close`);
+    const ctx = canvas.getContext('2d');
+
+    new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: data.labels,
+        datasets: [{
+          label: 'Close',
+          data: data.closes,
+          borderWidth: 2,
+          // (no explicit color so it follows default as requested)
+          fill: false,
+          tension: 0.25,
+          pointRadius: 0
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { grid: { display: false } },
+          y: { beginAtZero: false }
+        }
+      }
+    });
+  }
+})();
+</script>
 
 <style>
 :root{--bg:#0b0f14;--card:#111826;--text:#e6edf3;--muted:#97a3ad;--accent:#5b9cff;--border:#1f2937}
@@ -336,6 +416,22 @@ async def home(_: Request):
     )
 
 @app.get("/api/top-picks", dependencies=[Depends(check_auth)])
+from datetime import datetime  # you already import datetime at top
+
+@app.get("/api/candles/{product_id}", dependencies=[Depends(check_auth)])
+async def api_candles(product_id: str):
+    # Return last 30 daily closes for Chart.js
+    async with httpx.AsyncClient(timeout=25) as client:
+        candles = await get_daily_candles(client, product_id, days=30)
+    if not candles:
+        return {"labels": [], "closes": []}
+
+    # candles format: [time, low, high, open, close, volume]
+    last = candles[-30:]  # safest slice
+    labels = [datetime.utcfromtimestamp(int(c[0])).strftime("%m-%d") for c in last]
+    closes = [float(c[4]) for c in last]
+    return {"labels": labels, "closes": closes}
+
 async def api_top_picks():
     return JSONResponse({
         "last_refresh": last_refresh,
