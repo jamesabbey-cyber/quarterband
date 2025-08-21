@@ -8,18 +8,40 @@ from flask import Flask, request, Response, render_template_string, jsonify
 
 app = Flask(__name__)
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "QuarterBand/probability"})
+SESSION.headers.update({"User-Agent": "QuarterBand/quality-prob"})
 
-# --------- Config ---------
+# =========================
+# Config (env-tunable)
+# =========================
 QB_USER = os.getenv("QB_USER", "admin")
 QB_PASS = os.getenv("QB_PASS", "password")
 COINBASE_EXCHANGE_API = "https://api.exchange.coinbase.com"
 
-# Price window (defaults 0.10–0.25, can override via env)
+# Price window (starts here; can widen automatically)
 PRICE_MIN = float(os.getenv("PRICE_MIN", "0.10"))
 PRICE_MAX = float(os.getenv("PRICE_MAX", "0.25"))
 
-# --------- Auth ---------
+# Ensure at least N candidates; widen upper bound until we have them
+TOP_K         = int(os.getenv("TOP_K", "5"))     # how many to display
+MIN_COUNT     = int(os.getenv("MIN_COUNT", "5")) # minimum to find before ranking
+EXPAND_STEP   = float(os.getenv("EXPAND_STEP", "0.05"))
+MAX_PRICE_CAP = float(os.getenv("MAX_PRICE_CAP", "1.00"))
+
+# ---- Quality filter knobs ----
+# Liquidity (approx) = last price * 24h base volume
+MIN_24H_DOLLAR_VOL = float(os.getenv("MIN_24H_DOLLAR_VOL", "20000000"))  # $20M default
+# Bid/ask spread (% of mid); lower = tighter market
+MAX_SPREAD_PCT     = float(os.getenv("MAX_SPREAD_PCT", "0.008"))         # 0.8% default
+# Optional lists (BASE symbols, no "-USD")
+SYMBOL_WHITELIST = {x.strip().upper() for x in os.getenv("SYMBOL_WHITELIST", "").split(",") if x.strip()}
+SYMBOL_BLACKLIST = {x.strip().upper() for x in os.getenv(
+    "SYMBOL_BLACKLIST",
+    "USLESS,COOKIE,PNUT,PEPE,SHIB,FLOKI,WIF,BONK"
+).split(",") if x.strip()}
+
+# =========================
+# Basic Auth
+# =========================
 def check_auth(username, password):
     return username == QB_USER and password == QB_PASS
 
@@ -36,7 +58,9 @@ def requires_auth(f):
         return f(*args, **kwargs)
     return decorated
 
-# --------- Coinbase helpers ---------
+# =========================
+# Coinbase helpers
+# =========================
 def cb_get(path, **params):
     url = f"{COINBASE_EXCHANGE_API}{path}"
     r = SESSION.get(url, params=params, timeout=10)
@@ -57,47 +81,84 @@ def list_usd_products():
     return out
 
 def fetch_snapshot(pair):
-    """Return price + 24h stats for a product id like 'XYZ-USD'."""
-    t = cb_get(f"/products/{pair}/ticker")
-    s = cb_get(f"/products/{pair}/stats")
-    def f(k, d=0.0):
-        try: return float(s.get(k, d))
-        except Exception: return d
-    price = float(t.get("price") or t.get("last") or 0.0)
+    """Return price + 24h stats + bid/ask spread for 'XYZ-USD'."""
+    t = cb_get(f"/products/{pair}/ticker")   # price, bid, ask
+    s = cb_get(f"/products/{pair}/stats")    # open, high, low, volume (24h)
+
+    def f(d, k, dflt=0.0):
+        try:
+            return float(d.get(k, dflt))
+        except Exception:
+            return dflt
+
+    price = f(t, "price")
+    bid   = f(t, "bid")
+    ask   = f(t, "ask")
+    mid   = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else (price or 0.0)
+    spread_pct = ((ask - bid) / mid) if (bid > 0 and ask > 0 and mid > 0) else 1.0  # 100% if unknown
+
     return {
         "pair": pair,
         "price": price,
-        "open": f("open"),
-        "high": f("high"),
-        "low":  f("low"),
-        "volume": f("volume"),
+        "open":  f(s, "open"),
+        "high":  f(s, "high"),
+        "low":   f(s, "low"),
+        "volume": f(s, "volume"),  # base units over 24h
+        "bid": bid,
+        "ask": ask,
+        "spread_pct": spread_pct,
         "ts": int(time.time()),
     }
 
 def coinbase_trade_url(pair):
     return f"https://www.coinbase.com/advanced-trade/spot/{pair}"
 
-# --------- Probability (proxy) ---------
+# =========================
+# Quality + Probability
+# =========================
+def is_quality(snap):
+    """
+    Keep assets that actually transact:
+      - not in SYMBOL_BLACKLIST
+      - if SYMBOL_WHITELIST is set, only keep those symbols
+      - enforce 24h dollar volume and max bid/ask spread
+    """
+    base = snap["pair"].split("-")[0].upper()
+
+    if base in SYMBOL_BLACKLIST:
+        return False
+    if SYMBOL_WHITELIST and base not in SYMBOL_WHITELIST:
+        return False
+
+    dollar_vol = float(snap["price"]) * float(snap["volume"])
+    if dollar_vol < MIN_24H_DOLLAR_VOL:
+        return False
+
+    if snap.get("spread_pct", 1.0) > MAX_SPREAD_PCT:
+        return False
+
+    return True
+
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 def probability_score(snap):
     """
-    Proxy Prob( +70% in <30d ).
-    Replace with your calibrated model later. Inputs (0..1 each):
-      - Momentum m: (price - open)/open capped [-0.2,+0.2] → 0..1
-      - Expansion e: (high-low)/open capped [0,0.25] → 0..1
-      - Volume v: log10(volume) scaled to [0,1] (heuristic)
-    Score = 0.5*m + 0.35*e + 0.15*v → map to 0..1
+    Proxy Prob( +70% in <30d ). Replace later with calibrated model.
+    Inputs (0..1):
+      - Momentum m: (price-open)/open capped [-0.2,+0.2]
+      - Expansion e: (high-low)/open capped [0,0.25]
+      - Volume v: log10(volume) scaled [0,1]
+    Score = 0.50*m + 0.35*e + 0.15*v  ->  prob in [0.01, 0.99]
     """
     p, o, h, l, v = snap["price"], snap["open"], snap["high"], snap["low"], snap["volume"]
     if o <= 0 or p <= 0:
         return 0.05
 
-    mom_raw = clamp((p - o) / o, -0.20, 0.20)   # -20%..+20%
-    m = (mom_raw + 0.20) / 0.40                 # → 0..1
+    mom_raw = clamp((p - o) / o, -0.20, 0.20)      # -20%..+20%
+    m = (mom_raw + 0.20) / 0.40                    # 0..1
 
-    exp_raw = clamp((h - l) / max(o, 1e-9), 0.0, 0.25)  # 0..25%
+    exp_raw = clamp((h - l) / max(o, 1e-9), 0.0, 0.25)
     e = exp_raw / 0.25
 
     v_scaled = clamp((math.log10(max(v, 1e-6)) - 0) / 8, 0.0, 1.0)
@@ -106,7 +167,9 @@ def probability_score(snap):
     prob = clamp(0.05 + 0.90*score, 0.01, 0.99)
     return prob
 
-# --------- UI ---------
+# =========================
+# UI Template
+# =========================
 INDEX_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -137,7 +200,11 @@ INDEX_TEMPLATE = """
 <body>
   <div class="wrap">
     <h1>QuarterBand 70/30 <span class="badge">Auto-refresh 60s</span></h1>
-    <div class="muted">Coinbase USD markets • Price range: ${{ "%.2f"|format(price_min) }}–${{ "%.2f"|format(price_max) }} • Ranked by proxy probability of +70% in &lt;30d</div>
+    <div class="muted">
+      Coinbase USD markets • Effective price window:
+      ${{ "%.2f"|format(eff_min) }}–${{ "%.2f"|format(eff_max) }}
+      • Ranked by proxy probability of +70% in &lt;30d
+    </div>
 
     <div class="grid">
       {% for r in ranked %}
@@ -153,7 +220,7 @@ INDEX_TEMPLATE = """
       <h2>Details</h2>
       <table>
         <thead>
-          <tr><th>Pair</th><th>Price</th><th>Open</th><th>High</th><th>Low</th><th>Volume</th><th>Prob +70%/&lt;30d</th></tr>
+          <tr><th>Pair</th><th>Price</th><th>Open</th><th>High</th><th>Low</th><th>Volume</th><th>Spread</th><th>Prob +70%/&lt;30d</th></tr>
         </thead>
         <tbody>
           {% for r in ranked %}
@@ -164,55 +231,74 @@ INDEX_TEMPLATE = """
               <td>${{ "%.4f"|format(r.high) }}</td>
               <td>${{ "%.4f"|format(r.low) }}</td>
               <td>{{ "%.0f"|format(r.volume) }}</td>
+              <td>{{ "%.2f"|format(r.spread_pct*100) }}%</td>
               <td>{{ "%.1f"|format(r.prob*100) }}%</td>
             </tr>
           {% endfor %}
         </tbody>
       </table>
-      <div class="muted" style="margin-top:6px;">* Probabilities are an explanatory proxy for now; not financial advice.</div>
+      <div class="muted" style="margin-top:6px;">* Probabilities are an explanatory proxy; informational only, not financial advice.</div>
     </div>
   </div>
 </body>
 </html>
 """
 
-# --------- Routes ---------
+# =========================
+# Routes
+# =========================
 @app.route("/")
 @requires_auth
 def index():
+    # 1) Fetch all USD snapshots once
     products = list_usd_products()
-
-    snaps = []
+    all_snaps = []
     for p in products:
         try:
-            s = fetch_snapshot(p["id"])
-            # Price filter window: only 0.10–0.25 (defaults; configurable via env)
-            if PRICE_MIN <= s["price"] <= PRICE_MAX:
-                snaps.append(s)
+            all_snaps.append(fetch_snapshot(p["id"]))
         except Exception:
             continue
 
-    # Score + enrich
+    # 2) Drop meme/illiquid/wide-spread names first
+    all_snaps = [s for s in all_snaps if is_quality(s)]
+
+    # 3) Apply price window; widen upper bound until we hit MIN_COUNT or cap
+    eff_min = PRICE_MIN
+    eff_max = PRICE_MAX
+
+    def in_window(s): return eff_min <= s["price"] <= eff_max
+    candidates = [s for s in all_snaps if in_window(s)]
+
+    while len(candidates) < MIN_COUNT and eff_max < MAX_PRICE_CAP:
+        eff_max = min(eff_max + EXPAND_STEP, MAX_PRICE_CAP)
+        candidates = [s for s in all_snaps if eff_min <= s["price"] <= eff_max]
+
+    # 4) Score + enrich
     enriched = []
-    for s in snaps:
+    for s in candidates:
         prob = probability_score(s)
         enriched.append({**s,
             "prob": prob,
             "trade_url": coinbase_trade_url(s["pair"])
         })
 
-    # Rank by highest probability
-    ranked = sorted(enriched, key=lambda x: x["prob"], reverse=True)
+    # 5) Rank & keep TOP_K
+    ranked = sorted(enriched, key=lambda x: x["prob"], reverse=True)[:TOP_K]
 
     return render_template_string(
         INDEX_TEMPLATE,
         ranked=ranked,
-        price_min=PRICE_MIN,
-        price_max=PRICE_MAX
+        eff_min=eff_min,
+        eff_max=eff_max,
     )
 
 @app.route("/healthz")
 def healthz():
+    return jsonify(status="ok", ts=int(time.time()))
+
+# Alias for monitors that expect this path
+@app.route("/api/health")
+def api_health():
     return jsonify(status="ok", ts=int(time.time()))
 
 if __name__ == "__main__":
