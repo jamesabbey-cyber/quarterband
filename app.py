@@ -18,7 +18,8 @@ PRICE_MIN = float(os.getenv("PRICE_MIN", "0.10"))
 PRICE_MAX = float(os.getenv("PRICE_MAX", "0.25"))
 MIN_24H_DOLLAR_VOL = float(os.getenv("MIN_24H_DOLLAR_VOL", "10000000"))
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.35"))
-TOP_K = int(os.getenv("TOP_K", "10"))
+TOP_K = int(os.getenv("TOP_K", "13"))
+
 
 APP_USER = os.getenv("APP_USER", "admin")       # set on host
 APP_PASS = os.getenv("APP_PASS", "change-me")   # set on host
