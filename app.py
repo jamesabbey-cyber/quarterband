@@ -196,4 +196,115 @@ INDEX_TEMPLATE = """
     .prob { margin-top: 10px; font-size: 13px; color: #9aa4b2; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; background:#1f2e4a; color:#e6edf3; margin-left:8px; }
     .section { margin-top: 30px; }
-    table { width:
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid #1c2940; font-size: 14px; }
+    th { text-align: left; color: #9aa4b2; font-weight: 600; }
+    .ok { color: #34d399; }
+    .warn { color: #f59e0b; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>QuarterBand 70/30 <span class="badge">Auto-refresh 60s</span></h1>
+    <div class="muted">Basic-Auth protected • Coinbase USD market scan • Price ≥ $0.10 • Ranked by proxy probability of +70% in 30d</div>
+
+    <div class="grid">
+      {% for r in ranked %}
+        <a class="tile" href="{{ r.trade_url }}" target="_blank" rel="noopener noreferrer" aria-label="Open {{ r.pair }} on Coinbase">
+          <div class="pair">{{ r.pair }}</div>
+          <div class="price">${{ "%.4f"|format(r.price) }}</div>
+          <div class="prob">
+            Prob( +70% / 30d ): <strong>{{ "%.1f"|format(r.prob*100) }}%</strong>
+            {% if r.enter_now %}
+              <span class="badge">Entry zone</span>
+            {% endif %}
+          </div>
+        </a>
+      {% endfor %}
+    </div>
+
+    <div class="section">
+      <h2>Opportunity details</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Pair</th><th>Price</th><th>Open</th><th>High</th><th>Low</th>
+            <th>Prob +70%/30d</th><th>Entry Band</th><th>Stop</th><th>TP1</th><th>TP2</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in ranked %}
+            <tr>
+              <td><a href="{{ r.trade_url }}" target="_blank" rel="noopener noreferrer">{{ r.pair }}</a></td>
+              <td>${{ "%.4f"|format(r.price) }}</td>
+              <td>${{ "%.4f"|format(r.open) }}</td>
+              <td>${{ "%.4f"|format(r.high) }}</td>
+              <td>${{ "%.4f"|format(r.low) }}</td>
+              <td>{{ "%.1f"|format(r.prob*100) }}%</td>
+              <td>
+                {% if r.entry_band %}
+                  ${{ "%.4f"|format(r.entry_band[0]) }}–${{ "%.4f"|format(r.entry_band[1]) }}
+                  {% if r.enter_now %}<span class="ok">✓</span>{% endif %}
+                {% else %}-{% endif %}
+              </td>
+              <td>${{ "%.4f"|format(r.stop) }}</td>
+              <td>${{ "%.4f"|format(r.tp1) }}</td>
+              <td>${{ "%.4f"|format(r.tp2) }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <div class="muted" style="margin-top:8px;">
+        * Probabilities are model proxies for demonstration only; not financial advice. Replace with your calibrated model.
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+@app.route("/")
+@requires_auth
+def index():
+    # 1) Discover USD markets on Coinbase
+    usd_products = list_usd_products()
+
+    # 2) Fetch snapshots and filter price >= $0.10
+    snapshots = []
+    for p in usd_products:
+        try:
+            s = fetch_snapshot(p["id"])
+            if s["price"] >= 0.10:
+                snapshots.append(s)
+        except Exception:
+            continue
+
+    # 3) Score & enrich
+    enriched = []
+    for s in snapshots:
+        prob = probability_score(s)
+        bands = entry_exit_bands(s)
+        enriched.append({
+            **s,
+            "prob": prob,
+            "entry_ref": bands.get("entry_ref"),
+            "entry_band": bands.get("entry_band"),
+            "enter_now": bands.get("enter_now"),
+            "stop": bands.get("stop"),
+            "tp1": bands.get("tp1"),
+            "tp2": bands.get("tp2"),
+            "trade_url": coinbase_trade_url(s["pair"]),
+        })
+
+    # 4) Rank: highest probability first, top 50 to keep it snappy
+    ranked = sorted(enriched, key=lambda x: x["prob"], reverse=True)[:50]
+
+    return render_template_string(INDEX_TEMPLATE, ranked=ranked)
+
+@app.route("/healthz")
+def healthz():
+    return jsonify(status="ok", ts=int(time.time()))
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
