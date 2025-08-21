@@ -175,38 +175,4 @@ def clamp(x, lo, hi):
 
 def probability_score(snap):
     """
-    Proxy Prob( +70% in <30d ). Replace later with calibrated model.
-    Inputs (0..1):
-      - Momentum m: (price-open)/open capped [-0.2,+0.2]
-      - Expansion e: (high-low)/open capped [0,0.25]
-      - Volume v: log10(volume) scaled [0,1]
-    Score = 0.50*m + 0.35*e + 0.15*v  ->  prob in [0.01, 0.99]
-    """
-    p, o, h, l, v = snap["price"], snap["open"], snap["high"], snap["low"], snap["volume"]
-    if o <= 0 or p <= 0:
-        return 0.05
-
-    mom_raw = clamp((p - o) / o, -0.20, 0.20)      # -20%..+20%
-    m = (mom_raw + 0.20) / 0.40                    # 0..1
-
-    exp_raw = clamp((h - l) / max(o, 1e-9), 0.0, 0.25)
-    e = exp_raw / 0.25
-
-    v_scaled = clamp((math.log10(max(v, 1e-6)) - 0) / 8, 0.0, 1.0)
-    score = 0.50*m + 0.35*e + 0.15*v_scaled
-
-    prob = clamp(0.05 + 0.90*score, 0.01, 0.99)
-    return prob
-
-# =========================
-# Seasonality (hour-of-day)
-# =========================
-def hourly_seasonality(pair, days=30, gran=3600):
-    """
-    Computes hour-of-day profile over N days (UTC).
-    For each day, normalize each hour's close by that day's mean/std (z-score),
-    then average z per hour across days.
-    Returns: dict with mean_z_by_hour[0..23], buy_hours, sell_hours.
-    """
-    try:
-
+    Proxy Prob( +70% in <30d ). Replace later with
