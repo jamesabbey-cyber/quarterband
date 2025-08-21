@@ -19,6 +19,14 @@ PRICE_MAX = float(os.getenv("PRICE_MAX", "0.25"))
 MIN_24H_DOLLAR_VOL = float(os.getenv("MIN_24H_DOLLAR_VOL", "10000000"))
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.35"))
 TOP_K = int(os.getenv("TOP_K", "13"))
+# refresh cadence (seconds); can override in Render env as REFRESH_SECONDS=30
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "30"))
+
+# in-memory cache the background job will keep current
+CACHE: Dict[str, Any] = {
+    "picks": [],
+    "last_refresh": None,   # ISO timestamp
+}
 
 
 APP_USER = os.getenv("APP_USER", "admin")       # set on host
@@ -262,18 +270,53 @@ h2{margin:0;font-size:20px}.badge{background:rgba(91,156,255,.15);color:#b3d3ff;
 """
 env = Environment(loader=DictLoader({"index.html": HTML_TEMPLATE}),
                   autoescape=select_autoescape(["html"]))
+# ==========================================================
+# 🔄 Auto-refresh cache every 30 seconds when the app starts
+# ==========================================================
+
+REFRESH_SECONDS = 30
+last_refresh = None
+
+@app.on_event("startup")
+async def start_refresh():
+    asyncio.create_task(refresh_loop())
+
+async def refresh_loop():
+    global last_refresh
+    while True:
+        try:
+            picks = await get_ranked_assets()
+            CACHE["picks"] = picks
+            last_refresh = datetime.utcnow()
+            print(f"✅ Cache updated at {last_refresh}")
+        except Exception as e:
+            print(f"⚠️ Error refreshing cache: {e}")
+        await asyncio.sleep(REFRESH_SECONDS)
+
+
+# ==========================================================
+# ⬇️ Routes
+# ==========================================================
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(check_auth)])
 async def home(_: Request):
-    picks = await get_ranked_assets()
     tmpl = env.get_template("index.html")
-    return tmpl.render(picks=picks, price_min=PRICE_MIN, price_max=PRICE_MAX)
+    return tmpl.render(
+        picks=CACHE.get("picks", []),
+        price_min=PRICE_MIN,
+        price_max=PRICE_MAX,
+        last_refresh=last_refresh,
+    )
 
 @app.get("/api/top-picks", dependencies=[Depends(check_auth)])
 async def api_top_picks():
-    picks = await get_ranked_assets()
-    return JSONResponse(picks)
+    return JSONResponse({
+        "last_refresh": last_refresh,
+        "picks": CACHE.get("picks", [])
+    })
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "last_refresh": last_refresh}
+
+
