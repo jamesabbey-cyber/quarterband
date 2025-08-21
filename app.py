@@ -231,6 +231,7 @@ HTML_TEMPLATE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/><title>QuarterBand 70/30</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta http-equiv="refresh" content="{{ refresh_seconds }}">
 <style>
 :root{--bg:#0b0f14;--card:#111826;--text:#e6edf3;--muted:#97a3ad;--accent:#5b9cff;--border:#1f2937}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial;background:var(--bg);color:var(--text)}
@@ -305,7 +306,7 @@ async def home(_: Request):
         picks=CACHE.get("picks", []),
         price_min=PRICE_MIN,
         price_max=PRICE_MAX,
-        last_refresh=last_refresh,
+        refresh_seconds=REFRESH_SECONDS,  # <-- this is the new line
     )
 
 @app.get("/api/top-picks", dependencies=[Depends(check_auth)])
