@@ -294,7 +294,28 @@ async def refresh_loop():
             print(f"⚠️ Error refreshing cache: {e}")
         await asyncio.sleep(REFRESH_SECONDS)
 
-
+# -------- Candles API for charts --------
+@app.get("/api/candles", dependencies=[Depends(check_auth)])
+async def api_candles(product_id: str, days: int = 30, granularity: int = 86400):
+    """
+    Returns daily or hourly candles for a product_id.
+    granularity=86400 => daily; 3600 => hourly, etc.
+    Response: {"t": [iso times...], "c": [close prices...]}
+    """
+    end = datetime.utcnow().replace(microsecond=0)
+    start = end - timedelta(days=days + 1)
+    params = {"start": start.isoformat(), "end": end.isoformat(), "granularity": granularity}
+    async with httpx.AsyncClient(timeout=25) as client:
+        data = await cb_get(client, f"/products/{product_id}/candles", params=params)
+    if not isinstance(data, list):
+        return JSONResponse({"t": [], "c": []})
+    try:
+        data.sort(key=lambda c: c[0])  # ascending by time
+    except Exception:
+        pass
+    ts = [datetime.utcfromtimestamp(int(row[0])).isoformat() + "Z" for row in data]
+    closes = [float(row[4]) for row in data]
+    return JSONResponse({"t": ts, "c": closes})
 # ==========================================================
 # ⬇️ Routes
 # ==========================================================
